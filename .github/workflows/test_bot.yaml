@@ -2,18 +2,44 @@ name: Test Bot
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: reason and log forecasts but do NOT post them to Metaculus"
+        type: boolean
+        default: false
 
 # Add concurrency group to prevent parallel runs
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
-
-# Daily job to run the simple forecast bot
+# Manual smoke test against the bot-testing-area tournament. Fails loudly if
+# the secrets are missing (a human clicked the button, so show red).
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    timeout-minutes: 50
     steps: # sets up the steps that will be run in order
+      - name: Check that the two required secrets exist
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          missing=""
+          if [ -z "$METACULUS_TOKEN" ]; then missing="$missing METACULUS_TOKEN"; fi
+          if [ -z "$ANTHROPIC_API_KEY" ]; then missing="$missing ANTHROPIC_API_KEY"; fi
+          if [ -n "$missing" ]; then
+            {
+              echo "## ❌ Bot not configured yet"
+              echo
+              echo "Missing repository secret(s):$missing"
+              echo
+              echo "Add them under **Settings → Secrets and variables → Actions → New repository secret** (see SETUP-FOR-MAX.md), then run this workflow again."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Missing repository secret(s):$missing. See SETUP-FOR-MAX.md"
+            exit 1
+          fi
+
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
         uses: actions/checkout@v4
@@ -26,26 +52,37 @@ jobs:
           virtualenvs-create: true
           virtualenvs-in-project: true
           installer-parallel: true
-      # Adding the below will make the workflow faster, but will mean you don't automatically get updates from forecasting-tools and other packages
-      # - name: Load cached venv
-      #   id: cached-poetry-dependencies
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: .venv
-      #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
-        run: poetry install --no-interaction --no-root
+        run: poetry install --no-interaction --no-root --without dev
+
+      - name: Restore spend ledger (daily cap memory)
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: .spend
+          key: spend-ledger-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            spend-ledger-
+
       - name: Run bot
         run: |
           poetry run python main.py --mode test_questions
-        # this reads the environment variables from the github repository.
-        # Store under Settings --> Secrets and variables --> Actions
         env:
-          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
-          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          BOT_PUBLISH: ${{ inputs.dry_run == true && 'false' || vars.BOT_PUBLISH }}
+          BOT_MAIN_MODEL: ${{ vars.BOT_MAIN_MODEL }}
+          BOT_FALLBACK_MODEL: ${{ vars.BOT_FALLBACK_MODEL }}
+          BOT_EFFORT: ${{ vars.BOT_EFFORT }}
+          BOT_RESEARCH_MODE: ${{ vars.BOT_RESEARCH_MODE }}
+          BOT_MAX_COST_PER_RUN_USD: ${{ vars.BOT_MAX_COST_PER_RUN_USD }}
+          BOT_MAX_COST_PER_DAY_USD: ${{ vars.BOT_MAX_COST_PER_DAY_USD }}
+          BOT_PREDICTIONS_PER_QUESTION: ${{ vars.BOT_PREDICTIONS_PER_QUESTION }}
+
+      - name: Save spend ledger
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .spend
+          key: spend-ledger-${{ github.run_id }}-${{ github.run_attempt }}

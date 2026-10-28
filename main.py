@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import logging
+import os
+import sys
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -8,13 +10,29 @@ import dotenv
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
+    build_run_summary_markdown,
     check_environment,
     print_run_summary_banner,
     print_startup_banner,
     silence_noisy_dependencies,
+    write_job_summary,
 )
 
 silence_noisy_dependencies()
+
+from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
+    MonetaryCostManager,
+)
+
+from bot_config import BotSettings
+from claude_llm import ClaudeLlm, make_llms
+from forecast_guards import (
+    clip_probability,
+    sanitize_multiple_choice,
+    sanitize_percentiles,
+    validate_reasoning,
+)
+from spend_guard import SpendGuard, SpendLedger
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -135,7 +153,11 @@ class FallTemplateBot2026(ForecastBot):
 
             prompt = self._get_research_prompt(question, researcher)
 
-            if isinstance(researcher, GeneralLlm):
+            if isinstance(researcher, ClaudeLlm):
+                if researcher.web_search_enabled:
+                    prompt += self._web_search_instructions(researcher)
+                research = await researcher.invoke(prompt)
+            elif isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(prompt)
             elif (
                 researcher == "asknews/news-summaries"
@@ -162,6 +184,20 @@ class FallTemplateBot2026(ForecastBot):
                 research = await self.get_llm("researcher", "llm").invoke(prompt)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    @staticmethod
+    def _web_search_instructions(researcher: ClaudeLlm) -> str:
+        max_uses = (researcher._web_search_tool or {}).get("max_uses", 3)
+        return clean_indents(
+            f"""
+
+            You have a web search tool. Use it (at most {max_uses} searches) to find the
+            most recent, relevant reporting before you write the rundown. Prefer primary
+            and reputable sources, say what date each key fact is from, and list the URLs
+            you relied on at the end. If a search fails, continue with what you know and
+            say so.
+            """
+        )
 
     @staticmethod
     def _get_research_prompt(
@@ -250,7 +286,8 @@ class FallTemplateBot2026(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        # Hard clip to [1%, 99%]; rejects NaN/inf instead of silently posting it.
+        decimal_pred = clip_probability(binary_prediction.prediction_in_decimal)
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
@@ -325,6 +362,10 @@ class FallTemplateBot2026(ForecastBot):
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
+        )
+        # Exact option names, every option present once, >=1% each, sums to 1.
+        predicted_option_list = sanitize_multiple_choice(
+            question.options, predicted_option_list
         )
 
         logger.info(
@@ -423,6 +464,13 @@ class FallTemplateBot2026(ForecastBot):
             model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
+        )
+        percentile_list = sanitize_percentiles(
+            percentile_list,
+            lower_bound=question.lower_bound,
+            upper_bound=question.upper_bound,
+            open_lower_bound=question.open_lower_bound,
+            open_upper_bound=question.open_upper_bound,
         )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
@@ -524,11 +572,48 @@ class FallTemplateBot2026(ForecastBot):
             )
             for percentile in date_percentile_list
         ]
+        percentile_list = sanitize_percentiles(
+            percentile_list,
+            lower_bound=question.lower_bound.timestamp(),
+            upper_bound=question.upper_bound.timestamp(),
+            open_lower_bound=question.open_lower_bound,
+            open_upper_bound=question.open_upper_bound,
+        )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+    ##################################### PUBLISH SAFETY #####################################
+
+    def _create_unified_explanation(
+        self,
+        question: MetaculusQuestion,
+        research_prediction_collections,
+        aggregated_prediction,
+        final_cost: float,
+        time_spent_in_minutes: float,
+    ) -> str:
+        """
+        Runs right before the report is built and published. Refuse to go any
+        further if any forecast sample has no real written rationale, so a
+        prediction is never posted to Metaculus without the bot's reasoning
+        as its comment.
+        """
+        for i, collection in enumerate(research_prediction_collections, start=1):
+            for j, forecast in enumerate(collection.predictions, start=1):
+                validate_reasoning(
+                    forecast.reasoning,
+                    context=f"forecast {j} of report {i} for {question.page_url}",
+                )
+        return super()._create_unified_explanation(
+            question,
+            research_prediction_collections,
+            aggregated_prediction,
+            final_cost,
+            time_spent_in_minutes,
+        )
 
     def _create_resolved_question_parsing_message(self) -> str:
         return "- If the text concludes that the question has already resolved *in the past* (i.e. it treats the question as decided rather than something to forecast), please DO NOT return a parsed output, even if a final forecast is also given. Instead indicate that the answer is not explicitly given in the text.\n"
@@ -683,6 +768,119 @@ class FallTemplateBot2026(ForecastBot):
         )
 
 
+TOURNAMENT_URLS = {
+    "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
+    "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-fall-2026/",
+    "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
+}
+
+RunMode = Literal["tournament", "metaculus_cup", "test_questions"]
+
+
+def build_bot(settings: BotSettings, guard: SpendGuard) -> FallTemplateBot2026:
+    return FallTemplateBot2026(
+        research_reports_per_question=settings.research_reports_per_question,
+        predictions_per_research_report=settings.predictions_per_question,
+        use_research_summary_to_forecast=False,
+        publish_reports_to_metaculus=settings.publish,
+        folder_to_save_reports_to=None,
+        skip_previously_forecasted_questions=True,
+        extra_metadata_in_explanation=True,
+        llms=make_llms(settings, guard),
+    )
+
+
+async def forecast_for_mode(
+    bot: FallTemplateBot2026, run_mode: RunMode, client: MetaculusClient
+) -> list:
+    """
+    Each branch produces a list of ForecastReport (or exceptions, since
+    return_exceptions=True) which then flows into the summary printers.
+    """
+    if run_mode == "tournament":
+        seasonal = await bot.forecast_on_tournament(
+            client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        )
+        minibench = await bot.forecast_on_tournament(
+            client.CURRENT_MINIBENCH_ID, return_exceptions=True
+        )
+        return seasonal + minibench
+    if run_mode == "metaculus_cup":
+        # The Metaculus Cup may be uninitialized near the start of a season
+        # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
+        # MetaculusClient.AI_2027_TOURNAMENT_ID = "ai-2027" are also valid
+        # targets here.
+        bot.skip_previously_forecasted_questions = False
+        return await bot.forecast_on_tournament(
+            client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
+        )
+    if run_mode == "test_questions":
+        # The bot-testing-area tournament contains all question types and is
+        # the recommended target for smoke-testing your bot.
+        # https://www.metaculus.com/tournament/bot-testing-area/
+        bot.skip_previously_forecasted_questions = False
+        return await bot.forecast_on_tournament("bot-testing-area", return_exceptions=True)
+    raise ValueError(f"Unknown run mode: {run_mode}")
+
+
+def run(run_mode: RunMode, settings: BotSettings | None = None) -> int:
+    """Run the bot once. Returns the process exit code (0 = every question succeeded)."""
+    settings = settings or BotSettings.from_env()
+    for warning in settings.warnings:
+        logger.warning(warning)
+
+    guard = SpendGuard(
+        max_per_run_usd=settings.max_cost_per_run_usd,
+        max_per_day_usd=settings.max_cost_per_day_usd,
+        ledger=SpendLedger(settings.spend_ledger_path),
+        run_id=os.getenv("GITHUB_RUN_ID", "local"),
+    )
+    print_startup_banner(run_mode, will_publish=settings.publish, details=settings.describe())
+    logger.info(
+        f"Spent so far today (UTC) before this run: ${guard.day_spent_before_run_usd:.4f}"
+    )
+
+    bot = build_bot(settings, guard)
+    client = MetaculusClient()
+    forecast_reports: list = []
+    fatal_error: BaseException | None = None
+    independent_cost = 0.0
+    try:
+        # Second, independent cap: forecasting-tools' litellm-callback cost
+        # tracker also refuses to start a call once the per-run cap is reached.
+        with MonetaryCostManager(hard_limit=settings.max_cost_per_run_usd) as cost_manager:
+            forecast_reports = asyncio.run(forecast_for_mode(bot, run_mode, client))
+            independent_cost = cost_manager.current_usage
+    except Exception as e:  # noqa: BLE001 - we want *every* failure in the summary
+        fatal_error = e
+        logger.exception("Run failed before completing")
+    finally:
+        guard.finish(observed_total_usd=independent_cost)
+        summary = build_run_summary_markdown(
+            run_mode=run_mode,
+            will_publish=settings.publish,
+            forecast_reports=forecast_reports,
+            guard=guard,
+            settings=settings,
+            fatal_error=fatal_error,
+            tournament_url=TOURNAMENT_URLS.get(run_mode),
+        )
+        write_job_summary(summary)
+
+    if forecast_reports:
+        bot.log_report_summary(forecast_reports, raise_errors=False)
+        print_run_summary_banner(
+            forecast_reports,
+            will_publish=settings.publish,
+            tournament_url=TOURNAMENT_URLS.get(run_mode),
+        )
+
+    failed = [r for r in forecast_reports if isinstance(r, BaseException)]
+    if fatal_error is not None or failed or guard.tripped:
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -698,86 +896,9 @@ if __name__ == "__main__":
         help="What to forecast on (default: tournament)",
     )
     args = parser.parse_args()
-    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+    run_mode: RunMode = args.mode
 
+    # Exits 0 with a clear message on a scheduled run when the secrets are
+    # not set yet, and exits 1 on a manual run.
     check_environment(strict=True)
-    publish_to_metaculus = True
-    print_startup_banner(run_mode, will_publish=publish_to_metaculus)
-
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
-    template_bot = FallTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=5,
-        use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
-    )
-
-    # Per-mode tournament URL shown in the summary banner footer. These
-    # piggyback on the forecasting_tools SDK constants and need updating
-    # whenever those rotate seasons.
-    TOURNAMENT_URLS = {
-        "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
-        "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-fall-2026/",
-        "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
-    }
-
-    # Dispatch on mode. Each branch produces a list of ForecastReport (or
-    # exceptions, since return_exceptions=True) which then flows into the
-    # summary printers below.
-    client = MetaculusClient()
-    if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
-            )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
-    elif run_mode == "metaculus_cup":
-        # The Metaculus Cup may be uninitialized near the start of a season
-        # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
-        # MetaculusClient.AI_2027_TOURNAMENT_ID = "ai-2027" are also valid
-        # targets here.
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "test_questions":
-        # The bot-testing-area tournament contains all question types and is
-        # the recommended target for smoke-testing your bot.
-        # https://www.metaculus.com/tournament/bot-testing-area/
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
-            )
-        )
-
-    template_bot.log_report_summary(forecast_reports)
-    print_run_summary_banner(
-        forecast_reports,
-        will_publish=publish_to_metaculus,
-        tournament_url=TOURNAMENT_URLS.get(run_mode),
-    )
+    sys.exit(run(run_mode))

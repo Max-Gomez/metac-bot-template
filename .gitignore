@@ -174,3 +174,6 @@ cython_debug/
 
 # Local scratch/temp scripts
 temp/
+
+# Spend ledger written by the bot (carried between Actions runs via cache)
+.spend/

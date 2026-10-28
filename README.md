@@ -1,4 +1,10 @@
 # Simple Metaculus forecasting bot
+
+> **This fork runs on Claude with hard spend caps.** Start with **[SETUP-FOR-MAX.md](SETUP-FOR-MAX.md)**:
+> two secrets (`METACULUS_TOKEN`, `ANTHROPIC_API_KEY`), one Test Bot run, then enable the
+> schedule. Models, caps and research mode are set by environment variables (see
+> `bot_config.py` / `.env.template`). `poetry run pip install pytest pytest-asyncio && poetry run pytest -q` runs the test suite with no API calls.
+
 This repository contains a simple bot meant to get you started with creating your own bot for the AI Forecasting Tournament. Go to https://www.metaculus.com/futureeval/participate/ for more info and tournament rules (and then go to the  "Getting Started" section of our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page).
 
 **Brand new to this?** You can get a working bot running in about 5 minutes without writing a single line of code — just fork this repo, paste two API keys into GitHub, and click "Run workflow". See **[Quick start](#quick-start--fork-and-use-github-actions)** below.

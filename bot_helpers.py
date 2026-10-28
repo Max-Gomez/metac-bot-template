@@ -1,6 +1,6 @@
 """
 Runtime helpers for the template bot: environment validation, startup/result
-banners, and suppression of noisy upstream warnings.
+banners, GitHub job summaries, and suppression of noisy upstream warnings.
 
 Kept separate from main.py so that file can focus on the bot's forecasting
 logic. main_with_no_framework.py keeps its own inline copies on purpose --
@@ -12,7 +12,11 @@ import logging
 import os
 import sys
 import warnings
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover
+    from bot_config import BotSettings
+    from spend_guard import SpendGuard
 
 
 # Placeholder values shipped in .env.template. If a real env var still equals
@@ -24,6 +28,9 @@ _PLACEHOLDER_ENV_VALUES = {
     "your-token-here",
     "your-api-key-here",
 }
+
+REQUIRED_SECRETS = ("METACULUS_TOKEN", "ANTHROPIC_API_KEY")
+SETUP_DOC = "SETUP-FOR-MAX.md"
 
 
 def _is_real_env(name: str) -> bool:
@@ -55,41 +62,134 @@ def silence_noisy_dependencies() -> None:
     litellm_logger.propagate = False
 
 
-def check_environment(strict: bool = True) -> None:
-    """
-    Verify METACULUS_TOKEN is set; warn if no LLM key is configured. On
-    failure with strict=True, exits the process with a non-zero status.
-    """
-    problems: list[str] = []
+def missing_required_secrets() -> list[str]:
+    """Names of required secrets that are unset or still placeholders."""
+    return [name for name in REQUIRED_SECRETS if not _is_real_env(name)]
 
-    if not _is_real_env("METACULUS_TOKEN"):
-        problems.append(
-            "METACULUS_TOKEN is missing or still a placeholder. "
-            "Get one at https://www.metaculus.com/futureeval/participate/"
-        )
 
-    has_llm_key = any(
-        _is_real_env(k)
-        for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+def github_event_name() -> str:
+    return os.getenv("GITHUB_EVENT_NAME", "")
+
+
+def is_scheduled_run() -> bool:
+    return github_event_name() == "schedule"
+
+
+def check_environment(strict: bool = True) -> list[str]:
+    """
+    Verify METACULUS_TOKEN and ANTHROPIC_API_KEY are set.
+
+    Returns the list of missing secret names. When something is missing and
+    strict=True the process exits: with status 0 on a *scheduled* GitHub
+    Actions run (nothing is configured yet, so there is nothing to fail) and
+    status 1 everywhere else (a human asked for a run and should see red).
+    """
+    missing = missing_required_secrets()
+    if not missing:
+        return []
+
+    names = ", ".join(missing)
+    message = (
+        f"Bot is not configured: missing repository secret(s) {names}. "
+        f"Add them under Settings -> Secrets and variables -> Actions, "
+        f"see {SETUP_DOC}. No forecasts were made and nothing was spent."
     )
-    if not has_llm_key:
-        print(
-            "⚠️  No LLM key set (OPENROUTER/OPENAI/ANTHROPIC). The bot will fall back\n"
-            "    to the Metaculus LLM proxy. Free OpenRouter credits: "
-            "https://forms.gle/aQdYMq9Pisrf1v7d8\n"
-        )
-
-    if problems:
-        print("❌  Setup problems:")
-        for p in problems:
-            print(f"    • {p}")
-        if strict:
-            sys.exit(1)
+    print(f"❌  {message}")
+    write_job_summary(
+        "## ⏭️ Bot not configured yet\n\n"
+        f"Missing repository secret(s): **{names}**.\n\n"
+        f"Follow `{SETUP_DOC}` to add them. No forecasts were made and nothing was spent."
+    )
+    if strict:
+        sys.exit(0 if is_scheduled_run() else 1)
+    return missing
 
 
-def print_startup_banner(run_mode: str, will_publish: bool) -> None:
+def write_job_summary(markdown: str) -> None:
+    """
+    Append markdown to the GitHub Actions job summary (shown on the run page)
+    when running in Actions; always echo it to stdout too.
+    """
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(markdown.rstrip() + "\n\n")
+        except OSError as e:  # pragma: no cover
+            print(f"(could not write job summary: {e})")
+    print()
+    print(markdown)
+    print()
+
+
+def print_startup_banner(run_mode: str, will_publish: bool, details: str = "") -> None:
     publish = "publish=yes" if will_publish else "publish=no (dry run)"
-    print(f"🤖  Running mode={run_mode}, {publish}\n")
+    print(f"🤖  Running mode={run_mode}, {publish}")
+    if details:
+        print(f"    {details}")
+    print()
+
+
+def _short_error(exc: BaseException, limit: int = 300) -> str:
+    msg = f"{type(exc).__name__}: {exc}"
+    return msg if len(msg) <= limit else msg[:limit] + "..."
+
+
+def build_run_summary_markdown(
+    *,
+    run_mode: str,
+    will_publish: bool,
+    forecast_reports: Sequence[Any],
+    guard: "SpendGuard | None",
+    settings: "BotSettings | None",
+    fatal_error: BaseException | None = None,
+    tournament_url: str | None = None,
+) -> str:
+    """Short, phone-readable markdown for the GitHub job summary."""
+    from forecasting_tools import ForecastReport
+
+    valid = [r for r in forecast_reports if isinstance(r, ForecastReport)]
+    failed = [r for r in forecast_reports if isinstance(r, BaseException)]
+    publish_word = "posted to Metaculus" if will_publish else "produced (dry run, not posted)"
+
+    if fatal_error is not None:
+        headline = f"❌ Run crashed before finishing: `{_short_error(fatal_error)}`"
+    elif not forecast_reports:
+        headline = "ℹ️ No new questions to forecast on this run."
+    elif failed and not valid:
+        headline = f"❌ All {len(failed)} question(s) failed. Nothing was posted."
+    elif failed:
+        headline = (
+            f"⚠️ {len(valid)} forecast(s) {publish_word}, {len(failed)} question(s) failed."
+        )
+    else:
+        headline = f"✅ {len(valid)} forecast(s) {publish_word}."
+
+    lines = [f"## 🤖 Forecast run · mode `{run_mode}`", "", f"**{headline}**", ""]
+    if guard is not None:
+        lines += ["### Spend", guard.summary_markdown(), ""]
+    if valid:
+        lines.append("### Forecasts")
+        for r in valid:
+            note = f" ({len(r.errors)} minor error(s))" if r.errors else ""
+            lines.append(f"- ✅ {r.question.page_url}{note}")
+        lines.append("")
+    if failed:
+        lines.append("### Failed questions")
+        for exc in failed:
+            lines.append(f"- ❌ `{_short_error(exc)}`")
+        lines.append("")
+    if settings is not None:
+        lines.append(
+            f"<sub>{settings.describe()}</sub>"
+        )
+        if settings.warnings:
+            lines.append("")
+            for w in settings.warnings:
+                lines.append(f"- ⚠️ {w}")
+    if tournament_url:
+        lines += ["", f"Tournament: {tournament_url}"]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def print_run_summary_banner(
@@ -140,10 +240,7 @@ def print_run_summary_banner(
     if exceptions:
         print()
         for exc in exceptions:
-            msg = str(exc)
-            if len(msg) > 200:
-                msg = msg[:200] + "..."
-            print(f"  ❌ {type(exc).__name__}: {msg}")
+            print(f"  ❌ {_short_error(exc, 200)}")
 
     print(banner)
     print()
